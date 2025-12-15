@@ -11,7 +11,6 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """Tests build_tabText module."""
-from __future__ import absolute_import
 
 import pandas as pd
 from smjsindustry import build_tabText

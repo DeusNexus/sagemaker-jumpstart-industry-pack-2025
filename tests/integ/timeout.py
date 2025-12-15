@@ -10,24 +10,23 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-from __future__ import absolute_import
 
 from contextlib import contextmanager
 import logging
 import stopit
 
-
 LOGGER = logging.getLogger("timeout")
-
 
 @contextmanager
 def timeout(seconds=0, minutes=0, hours=0):
     """
     Add a signal-based timeout to any block of code.
     If multiple time units are specified, they will be added together to determine time limit.
+    
     Usage:
     with timeout(seconds=5):
         my_slow_function(...)
+    
     Args:
         - seconds: The time limit, in seconds.
         - minutes: The time limit, in minutes.

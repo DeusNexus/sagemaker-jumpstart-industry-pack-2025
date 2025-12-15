@@ -11,13 +11,16 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """The module that builds a TabText dataframe."""
-from __future__ import absolute_import
 
 import pandas as pd
-from smjsindustry.finance.utils import get_freq_label
+from typing import Literal  # Added for strict type checking of pd.merge 'how'
+from smjsindustry.finance.utils import FreqLiteral, get_freq_label
 
 
 JUMPSTART_NORMALIZED_DATE = "jumpstart-normalized-date"
+
+# Define the acceptable merge 'how' types as a literal for clarity
+MergeHow = Literal["left", "right", "outer", "inner"]
 
 
 def build_tabText(
@@ -27,8 +30,8 @@ def build_tabText(
     text_df: pd.DataFrame,
     text_key: str,
     text_date_column: str,
-    how: str = "inner",
-    freq: str = "Q",
+    how: MergeHow = "inner",  # Changed type hint to Literal for strict type checking
+    freq: FreqLiteral = "Q",
 ) -> pd.DataFrame:
     """Builds a TabText dataframe by joining the columns in the tabular and text dataframes.
 
@@ -57,16 +60,14 @@ def build_tabText(
         pandas.DataFrame: The joined dataframe object.
     """
     if tabular_date_column and text_date_column:
-        tabular_df[JUMPSTART_NORMALIZED_DATE] = tabular_df[tabular_date_column]
-        for i in range(len(tabular_df)):
-            date_value = tabular_df.loc[i, tabular_date_column]
-            freq_label = get_freq_label(date_value, freq)
-            tabular_df.loc[i, JUMPSTART_NORMALIZED_DATE] = freq_label
-        text_df[JUMPSTART_NORMALIZED_DATE] = text_df[text_date_column]
-        for i in range(len(text_df)):
-            date_value = text_df.loc[i, text_date_column]
-            freq_label = get_freq_label(date_value, freq)
-            text_df.loc[i, JUMPSTART_NORMALIZED_DATE] = freq_label
+        # Replaced loop with vectorized apply + astype(str) to fix Scalar to str error
+        tabular_df[JUMPSTART_NORMALIZED_DATE] = tabular_df[tabular_date_column].astype(str).apply(
+            lambda date_value: get_freq_label(date_value, freq)
+        )
+        text_df[JUMPSTART_NORMALIZED_DATE] = text_df[text_date_column].astype(str).apply(
+            lambda date_value: get_freq_label(date_value, freq)
+        )
+        
         joined = pd.merge(
             tabular_df,
             text_df,

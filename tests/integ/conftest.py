@@ -10,8 +10,6 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-from __future__ import absolute_import
-
 
 import json
 import os
@@ -21,9 +19,12 @@ import pytest
 
 from botocore.config import Config
 
-from sagemaker import Session, utils
+from sagemaker.core.processing import (
+    Session,
+)
+from sagemaker.core import common_utils as utils
 
-DEFAULT_REGION = "us-west-2"
+DEFAULT_REGION = "us-east-1"
 CUSTOM_BUCKET_NAME_PREFIX = "smjsindustry-custom-bucket"
 
 NO_M4_REGIONS = [
@@ -35,7 +36,6 @@ NO_M4_REGIONS = [
     "me-south-1",
 ]
 
-
 def pytest_addoption(parser):
     parser.addoption("--sagemaker-client-config", action="store", default=None)
     parser.addoption("--sagemaker-runtime-config", action="store", default=None)
@@ -45,9 +45,12 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     bc = config.getoption("--boto-config")
     parsed = json.loads(bc) if bc else {}
-    region = parsed.get("region_name", boto3.session.Session().region_name)
+    region = parsed.get("region_name", boto3.Session().region_name)
     if region:
         os.environ["TEST_AWS_REGION_NAME"] = region
+        # Ensure downstream SDK calls (like describe jobs) stay in the same region.
+        os.environ.setdefault("AWS_REGION", region)
+        os.environ.setdefault("AWS_DEFAULT_REGION", region)
 
 
 @pytest.fixture(scope="session")
@@ -95,6 +98,8 @@ def sagemaker_session(sagemaker_client_config, sagemaker_runtime_config, boto_se
         else None
     )
 
+    # Note: In SDK v3, ensure Session arguments align with the new signature if they have changed.
+    # Standard instantiation usually accepts boto_session and client.
     return Session(
         boto_session=boto_session,
         sagemaker_client=sagemaker_client,
@@ -105,16 +110,17 @@ def sagemaker_session(sagemaker_client_config, sagemaker_runtime_config, boto_se
 @pytest.fixture(scope="module")
 def custom_bucket_name(boto_session):
     region = boto_session.region_name
+    # UPDATED: Use f-string
     account = boto_session.client(
         "sts", region_name=region, endpoint_url=utils.sts_regional_endpoint(region)
     ).get_caller_identity()["Account"]
-    return "{}-{}-{}".format(CUSTOM_BUCKET_NAME_PREFIX, region, account)
+    return f"{CUSTOM_BUCKET_NAME_PREFIX}-{region}-{account}"
 
 
 @pytest.fixture(scope="session")
 def cpu_instance_type(sagemaker_session, request):
     region = sagemaker_session.boto_session.region_name
+    # Use burstable t3 mediums everywhere to minimize account quota requirements.
     if region in NO_M4_REGIONS:
-        return "ml.m5.xlarge"
-    else:
-        return "ml.m4.xlarge"
+        return "ml.t3.medium"
+    return "ml.t3.medium"

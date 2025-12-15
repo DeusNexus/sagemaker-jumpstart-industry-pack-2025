@@ -1,37 +1,50 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License"). You
-# may not use this file except in compliance with the License. A copy of
-# the License is located at
-#
-#     http://aws.amazon.com/apache2.0/
-#
-# or in the "license" file accompanying this file. This file is
-# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
-# ANY KIND, either express or implied. See the License for the specific
-# language governing permissions and limitations under the License.
-"""The SageMaker JumpStart Industry processing job module.
-
-These classes assist in the automatic creation of SageMaker
-processing jobs that perform heavy-duty computational tasks that
-are useful in financial use cases. Such processing jobs include
-but are not limited to downloading and parsing SEC filings from
-the EDGAR database, summarizing text using the Jaccard or k-medoids
-algorithms, and scoring documents using NLP techniques.
+# Copyright Amazon.com, Inc. or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
 
 """
-from __future__ import print_function, absolute_import
+SageMaker JumpStart Industry processing job module (SDK v3 compatible).
+"""
 
+import copy
 import json
 import logging
 import os
+import shutil
 import tempfile
-import copy
-from typing import Dict, List, Union
-from six.moves.urllib.parse import urlparse
+import uuid
+from typing import Dict, Mapping, MutableMapping, Optional, Union
+from urllib.parse import urlparse
 
-import sagemaker
-from sagemaker.processing import ProcessingInput, ProcessingOutput, Processor
+JSONDict = MutableMapping[str, object]
+
+try:
+    import boto3  # type: ignore[import]
+except ImportError:  # pragma: no cover - handled via tests
+    boto3 = None  # type: ignore[assignment]
+
+try:
+    from sagemaker.core.processing import (
+        ProcessingInput,
+        ProcessingOutput,
+        ProcessingS3Input,
+        ProcessingS3Output,
+        Processor,
+        Session,
+        Tags,
+    )
+except ImportError:
+    from sagemaker.core.processing import (
+        ProcessingInput,
+        ProcessingOutput,
+        Processor,
+        Session,
+        Tags,
+    )
+    from sagemaker.core.shapes.shapes import ProcessingS3Input, ProcessingS3Output
+from sagemaker.core.network import NetworkConfig
+from sagemaker.core.utils.exceptions import FailedStatusError
+from sagemaker.core.common_utils import base_from_name
+
 from smjsindustry.finance.processor_config import (
     JaccardSummarizerConfig,
     KMedoidsSummarizerConfig,
@@ -48,58 +61,24 @@ from smjsindustry.finance.constants import (
 )
 from smjsindustry.finance.utils import retrieve_image
 
-logger = logging.getLogger()
+LOCAL_DATALOADER_FIXTURE_ENV = "SMJS_FINANCE_DATALOADER_LOCAL_DATASET"
+LOCAL_DATALOADER_FALLBACK_ENV = "SMJS_FINANCE_DATALOADER_FALLBACK_DATASET"
 
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Base processor
+# =============================================================================
 
 class FinanceProcessor(Processor):
-    """Handles SageMaker JumpStart Industry processing tasks.
-
-    This base class is for handling SageMaker JumpStart Industry processing tasks.
-    See its subclasses, such as :class:`~smjsindustry.Summarizer`
-    and :class:`~smjsindustry.NLPScorer`, for concrete
-    examples of ``FinanceProcessors`` that perform specific computation tasks.
-
-    Args:
-        role (str): An AWS IAM role name or ARN. Amazon SageMaker Processing
-            uses this role to access AWS resources, such as
-            data stored in Amazon S3.
-        instance_count (int): The number of instances with which to run
-            a processing job.
-        instance_type (str): The type of Amazon EC2 instance to use for
-            processing. For example, ``'ml.c4.xlarge'``.
-        volume_size_in_gb (int): Size in GB of the EBS volume
-            to use for storing data during processing (default: 30).
-        volume_kms_key (str): An AWS KMS key for the processing
-            volume (default: None).
-        output_kms_key (str): The AWS KMS key ID for processing job outputs (default: None).
-        max_runtime_in_seconds (int): Timeout in seconds (default: None).
-            After this amount of time, Amazon SageMaker terminates the job,
-            regardless of its current status. If ``max_runtime_in_seconds`` is not
-            specified, the default value is 24 hours.
-        sagemaker_session (:class:`~sagemaker.session.Session`):
-            A `SageMaker Session
-            <https://sagemaker.readthedocs.io/en/stable/api/utility/session.html#sagemaker.session.Session>`_
-            object which manages interactions with Amazon SageMaker and
-            any other AWS services needed. If not specified, the processor creates
-            one using the default AWS configuration chain.
-        tags (List[Dict[str, str]]): List of tags to be passed to the processing job
-            (default: None). To learn more, see
-            `Tag <https://docs.aws.amazon.com/sagemaker/latest/dg/API_Tag.html>`_
-            in the *Amazon SageMaker API Reference*.
-        base_job_name (str):
-            A prefix for the processing job name. If not specified,
-            the processor generates a default job name,
-            based on the processing image name and the current timestamp.
-        network_config (:class:`~sagemaker.network.NetworkConfig`):
-            A `SageMaker NatworkConfig <https://sagemaker.readthedocs.io/en/stable/api/utility/network.html>`_
-            object that configures network isolation, encryption of
-            inter-container traffic, security group IDs, and subnets.
-
-    """
+    """Base class for all JumpStart Industry processing jobs."""
 
     _PROCESSING_CONFIG = "/opt/ml/processing/input/config"
     _PROCESSING_DATA = "/opt/ml/processing/input/data"
     _PROCESSING_OUTPUT = "/opt/ml/processing/output"
+    _DEFAULT_OUTPUT_NAME = "output-1"
+
     _CONFIG_FILE = "job_config.json"
     _CONFIG_INPUT_NAME = "config"
     _DATA_INPUT_NAME = "data"
@@ -110,114 +89,147 @@ class FinanceProcessor(Processor):
         instance_count: int,
         instance_type: str,
         volume_size_in_gb: int = 30,
-        volume_kms_key: str = None,
-        output_kms_key: str = None,
-        max_runtime_in_seconds: int = None,
-        sagemaker_session: sagemaker.session.Session = None,
-        tags: List[Dict[str, str]] = None,
-        base_job_name: str = None,
-        network_config: sagemaker.network.NetworkConfig = None,
+        volume_kms_key: Optional[str] = None,
+        output_kms_key: Optional[str] = None,
+        max_runtime_in_seconds: Optional[int] = None,
+        sagemaker_session: Optional[Session] = None,
+        tags: Optional[Tags] = None,
+        base_job_name: Optional[str] = None,
+        network_config: Optional[NetworkConfig] = None,
     ):
-        """Initializes a ``Processor`` instance for SageMaker JumpStart Industry processing jobs."""
-        container_uri = retrieve_image(sagemaker_session.boto_region_name)
-        super(FinanceProcessor, self).__init__(
-            role,
-            container_uri,
-            instance_count,
-            instance_type,
+        if sagemaker_session is None:
+            session: Session = Session()
+        else:
+            session = sagemaker_session
+
+        region = session.boto_region_name
+        if region is None:
+            raise ValueError("SageMaker session must have an associated region.")
+
+        container_uri = retrieve_image(region)
+
+        if boto3 is None:
+            raise RuntimeError(
+                "boto3 is required to use FinanceProcessor. "
+                "Install boto3 or provide a compatible stub."
+            )
+
+        super().__init__(
+            role=role,
+            image_uri=container_uri,
+            instance_count=instance_count,
+            instance_type=instance_type,
             volume_size_in_gb=volume_size_in_gb,
             volume_kms_key=volume_kms_key,
             output_kms_key=output_kms_key,
             max_runtime_in_seconds=max_runtime_in_seconds,
-            sagemaker_session=sagemaker_session,
+            sagemaker_session=session,
             tags=tags,
             base_job_name=base_job_name,
             network_config=network_config,
         )
 
-    def run(self, **kwargs):
-        """Overrides the base class method."""
-        logger.info("You are not charged when EC2 instances are in pending state")
-        logger.info(
-            "More info: "
-            "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html"
+        self._s3 = boto3.client(
+            "s3",
+            region_name=region,
         )
-        super(FinanceProcessor, self).run(**kwargs)
 
+    def _build_processing_input(self, input_name: str, source: str, destination: str) -> ProcessingInput:
+        """Create a ProcessingInput definition aligned with SageMaker SDK v3."""
+        return ProcessingInput(
+            input_name=input_name,
+            s3_input=ProcessingS3Input(
+                s3_uri=source,
+                local_path=destination,
+                s3_data_type="S3Prefix",
+                s3_input_mode="File",
+                s3_data_distribution_type="FullyReplicated",
+                s3_compression_type="None",
+            ),
+        )
+
+    def _build_processing_output(self, s3_destination: str) -> ProcessingOutput:
+        """Create a ProcessingOutput definition aligned with SageMaker SDK v3."""
+        return ProcessingOutput(
+            output_name=self._DEFAULT_OUTPUT_NAME,
+            s3_output=ProcessingS3Output(
+                s3_uri=s3_destination,
+                local_path=self._PROCESSING_OUTPUT,
+                s3_upload_mode="EndOfJob",
+            ),
+        )
+
+    # ---------------------------------------------------------------------
+    # S3 helpers (REQUIRED for SDK v3)
+    # ---------------------------------------------------------------------
+
+    def _upload_dir_to_s3(self, local_dir: str, s3_prefix: str) -> str:
+        parsed = urlparse(s3_prefix)
+        if parsed.scheme != "s3":
+            raise ValueError("s3_prefix must be an s3:// URI")
+
+        bucket = parsed.netloc
+        key_prefix = parsed.path.lstrip("/")
+
+        for root, _, files in os.walk(local_dir):
+            for fname in files:
+                local_path = os.path.join(root, fname)
+                rel_path = os.path.relpath(local_path, local_dir)
+                s3_key = f"{key_prefix}/{rel_path}"
+                self._s3.upload_file(local_path, bucket, s3_key)
+
+        return f"s3://{bucket}/{key_prefix}"
+
+    def _upload_file_to_s3_uri(self, local_path: str, s3_uri: str) -> str:
+        parsed = urlparse(s3_uri)
+        if parsed.scheme != "s3":
+            raise ValueError("Destination must be an s3:// URI")
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(local_path)
+        self._s3.upload_file(local_path, bucket, key)
+        return f"s3://{bucket}/{key}"
+
+    def _ensure_s3_input(self, path: str, s3_base_prefix: str) -> str:
+        if path.startswith("s3://"):
+            return path
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+
+        upload_prefix = f"{s3_base_prefix}/{uuid.uuid4().hex}"
+        parsed = urlparse(upload_prefix)
+
+        if os.path.isfile(path):
+            bucket = parsed.netloc
+            key = f"{parsed.path.lstrip('/')}/{os.path.basename(path)}"
+            self._s3.upload_file(path, bucket, key)
+            return f"s3://{bucket}/{key}"
+
+        return self._upload_dir_to_s3(path, upload_prefix)
+
+    # ---------------------------------------------------------------------
+
+    def run(self, *args, **kwargs):
+        logger.info(
+            "EC2 instances are not billed while in the 'pending' state. "
+            "See: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html"
+        )
+        return super().run(*args, **kwargs)
+
+
+# =============================================================================
+# Summarizer
+# =============================================================================
 
 class Summarizer(FinanceProcessor):
-    """Initializes a Summarizer instance that summarizes text.
 
-    For the general processing job configuration parameters of this class,
-    see the parameters in the
-    :class:`~smjsindustry.finance.processor.FinanceProcessor` class.
-
-    It summarizes text while preserving key information content and overall meaning.
-    Summarization can be performed using either the Jaccard algorithm or the k-medoids algorithm.
-    See the summarize methods for details regarding the specific algorithms used.
-
-    """
-
-    def __init__(
-        self,
-        role: str,
-        instance_count: int,
-        instance_type: str,
-        volume_size_in_gb: int = 30,
-        volume_kms_key: str = None,
-        output_kms_key: str = None,
-        max_runtime_in_seconds: int = None,
-        sagemaker_session: sagemaker.session.Session = None,
-        tags: List[Dict[str, str]] = None,
-        network_config: sagemaker.network.NetworkConfig = None,
-    ):
-        """Initializes a Summarizer instance to summarize text.
-
-        The summarizer instance handles text summarization to provide a concise summary
-        while preserving key information content and overall meaning. Please see
-        the summarize method for details regarding the specific algorithms used.
-
-        Args:
-            role (str): An AWS IAM role name or ARN. Amazon SageMaker Processing
-                uses this role to access AWS resources, such as
-                data stored in Amazon S3.
-            instance_count (int): The number of instances with which to run
-                a processing job.
-            instance_type (str): The type of EC2 instance to use for
-                processing, for example, 'ml.c4.xlarge'.
-            volume_size_in_gb (int): Size in GB of the EBS volume
-                to use for storing data during processing (default: 30).
-            volume_kms_key (str): A KMS key for the processing
-                volume (default: None).
-            output_kms_key (str): The KMS key ID for processing job outputs (default: None).
-            max_runtime_in_seconds (int): Timeout in seconds (default: None).
-                After this amount of time, Amazon SageMaker terminates the job,
-                regardless of its current status. If `max_runtime_in_seconds` is not
-                specified, the default value is 24 hours.
-            sagemaker_session (:class:`~sagemaker.session.Session`):
-                Session object which manages interactions with Amazon SageMaker and
-                any other AWS services needed. If not specified, the processor creates
-                one using the default AWS configuration chain.
-            tags (List[Dict[str, str]]): List of tags to be passed to the processing job
-                (default: None). For more, see
-                https://docs.aws.amazon.com/sagemaker/latest/dg/API_Tag.html.
-            network_config (:class:`~sagemaker.network.NetworkConfig`):
-                A :class:`~sagemaker.network.NetworkConfig`
-                object that configures network isolation, encryption of
-                inter-container traffic, security group IDs, and subnets.
-        """
-        super(Summarizer, self).__init__(
-            role,
-            instance_count,
-            instance_type,
-            volume_size_in_gb=volume_size_in_gb,
-            volume_kms_key=volume_kms_key,
-            output_kms_key=output_kms_key,
-            max_runtime_in_seconds=max_runtime_in_seconds,
-            sagemaker_session=sagemaker_session,
-            tags=tags,
-            base_job_name=SUMMARIZER_JOB_NAME,
-            network_config=network_config,
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            base_job_name=base_from_name(SUMMARIZER_JOB_NAME),
+            **kwargs,
         )
 
     def summarize(
@@ -231,158 +243,53 @@ class Summarizer(FinanceProcessor):
         wait: bool = True,
         logs: bool = True,
     ):
-        """Runs a processing job to generate Jaccard or k-medoid summary.
+        if urlparse(s3_output_path).scheme != "s3":
+            raise ValueError("s3_output_path must be an s3:// URI")
 
-        The summaries generated by the Jaccard algorithm give the main theme of the document
-        by extracting the sentences with the greatest similarity among all sentences.
-        Similarity is measured using the Jaccard coefficient, which, for a pair of sentences,
-        is the number of common words between them normalized by the size of the super set
-        of the words in the two sentences.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, self._CONFIG_FILE)
 
-        The k-medoids algorithm clusters sentences and
-        outputs the medoids of each cluster as a summary.
+            cfg: JSONDict = dict(copy.deepcopy(summarizer_config.get_config()))
 
-        Args:
-            summarizer_config (Union[JaccardSummarizerConfig, KMedoidsSummarizerConfig]):
-                The config for the JaccardSummarizer or KmedoidSummarizer.
-            text_column_name (str): The name for column containing text to be summarized.
-            input_file_path (str): The input file path pointing to the input dataframe
-                containing the text to be summarized. It can be a local file or an S3 path.
-            s3_output_path (str): An S3 prefix in the format of
-                ``'s3://<output bucket name>/output/path'``.
-            output_file_name (str): The output file name. The full path is
-                ``'s3://<output bucket name>/output/path/output_file_name'``.
-            new_summary_column_name (str): The column name for the summary in the given
-                dataframe (default: ``"summary"``).
-            wait (bool): Whether the call should wait until the job completes (default: ``True``).
-            logs (bool): Whether to show the logs produced by the job (default: ``True``).
+            vocab = cfg.get("vocabulary")
 
-        Raises:
-            ValueError: if ``logs`` is True but ``wait`` is False.
-        """
-        parse_result = urlparse(s3_output_path)
-        if parse_result.scheme != "s3":
-            raise Exception(
-                "Expected an S3 prefix in the format of s3://<output bucket name>/output/path"
-            )
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            summarizer_config_file = os.path.join(tmpdirname, self._CONFIG_FILE)
-            with open(summarizer_config_file, "w") as file_handle:
-                cloned_config = copy.deepcopy(summarizer_config.get_config())
-                if cloned_config["processor_type"] == JACCARD_SUMMARIZER:
-                    if isinstance(cloned_config["vocabulary"], set):
-                        cloned_config["vocabulary"] = list(cloned_config["vocabulary"])
-                cloned_config["text_column_name"] = text_column_name
-                cloned_config["new_summary_column_name"] = new_summary_column_name
-                cloned_config["output_file_name"] = output_file_name
-                json.dump(cloned_config, file_handle)
-            config_input = ProcessingInput(
-                source=tmpdirname,
-                destination=self._PROCESSING_CONFIG,
-                input_name=self._CONFIG_INPUT_NAME,
-                s3_data_type="S3Prefix",
-                s3_input_mode="File",
-                s3_data_distribution_type="FullyReplicated",
-                s3_compression_type="None",
-            )
-            data_input = ProcessingInput(
-                source=input_file_path,
-                destination=self._PROCESSING_DATA,
-                input_name=self._DATA_INPUT_NAME,
-                s3_data_type="S3Prefix",
-                s3_input_mode="File",
-                s3_data_distribution_type="FullyReplicated",
-                s3_compression_type="None",
-            )
-            result_output = ProcessingOutput(
-                source=self._PROCESSING_OUTPUT,
-                destination=s3_output_path,
-                s3_upload_mode="EndOfJob",
-            )
-            logger.info("Starting SageMaker processing job to summarize")
-            super().run(
-                inputs=[config_input, data_input],
-                outputs=[result_output],
-                wait=wait,
-                logs=logs,
-            )
-            logger.info("Completed SageMaker processing job to summarize")
+            if cfg.get("processor_type") == JACCARD_SUMMARIZER and isinstance(vocab, set):
+                cfg["vocabulary"] = list(vocab)
 
+            cfg.update(
+                text_column_name=text_column_name,
+                new_summary_column_name=new_summary_column_name,
+                output_file_name=output_file_name,
+            )
+
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f)
+
+            s3_cfg = self._upload_dir_to_s3(tmp, f"{s3_output_path}/_config")
+            s3_data = self._ensure_s3_input(input_file_path, f"{s3_output_path}/_data")
+
+            inputs = [
+                self._build_processing_input(self._CONFIG_INPUT_NAME, s3_cfg, self._PROCESSING_CONFIG),
+                self._build_processing_input(self._DATA_INPUT_NAME, s3_data, self._PROCESSING_DATA),
+            ]
+
+            outputs = [self._build_processing_output(s3_output_path)]
+
+            logger.info("Starting summarization job")
+            self.run(inputs=inputs, outputs=outputs, wait=wait, logs=logs)
+
+
+# =============================================================================
+# NLP Scorer
+# =============================================================================
 
 class NLPScorer(FinanceProcessor):
-    """Calculates NLP scores for text using default or user-provided word lists.
 
-    Text that contains many words and phrases that are related to the provided
-    word lists will receive high scores while text that is unrelated will score lower.
-
-    The NLP scores report the percentage of words in a document that match
-    a list of words, which is called a lexicon.
-    The matching is undertaken after stemming of the document and the lexicon.
-    NLP scoring of sentiment is based on the Vader sentiment lexicon.
-    NLP Scoring of readability is based on the Gunning-Fog index.
-
-    For the general processing job configuration parameters of this class,
-    see the parameters in the
-    :class:`~smjsindustry.finance.processor.FinanceProcessor` class.
-
-    """
-
-    def __init__(
-        self,
-        role: str,
-        instance_count: int,
-        instance_type: str,
-        volume_size_in_gb: int = 30,
-        volume_kms_key: str = None,
-        output_kms_key: str = None,
-        max_runtime_in_seconds: int = None,
-        sagemaker_session: sagemaker.session.Session = None,
-        tags: List[Dict[str, str]] = None,
-        network_config: sagemaker.network.NetworkConfig = None,
-    ):
-        """Initializes an NLPScorer instance to calculate NLP scores for text.
-
-        Args:
-            role (str): An AWS IAM role name or ARN. Amazon SageMaker Processing
-                uses this role to access AWS resources, such as
-                data stored in Amazon S3.
-            instance_count (int): The number of instances with which to run
-                a processing job.
-            instance_type (str): The type of EC2 instance to use for
-                processing, for example, 'ml.c4.xlarge'.
-            volume_size_in_gb (int): Size in GB of the EBS volume
-                to use for storing data during processing (default: 30).
-            volume_kms_key (str): A KMS key for the processing
-                volume (default: None).
-            output_kms_key (str): The KMS key ID for processing job outputs (default: None).
-            max_runtime_in_seconds (int): Timeout in seconds (default: None).
-                After this amount of time, Amazon SageMaker terminates the job,
-                regardless of its current status. If `max_runtime_in_seconds` is not
-                specified, the default value is 24 hours.
-            sagemaker_session (:class:`~sagemaker.session.Session`):
-                Session object which manages interactions with Amazon SageMaker and
-                any other AWS services needed. If not specified, the processor creates
-                one using the default AWS configuration chain.
-            tags (List[Dict[str, str]]): List of tags to be passed to the processing job
-                (default: None). For more, see
-                https://docs.aws.amazon.com/sagemaker/latest/dg/API_Tag.html.
-            network_config (:class:`~sagemaker.network.NetworkConfig`):
-                A :class:`~sagemaker.network.NetworkConfig`
-                object that configures network isolation, encryption of
-                inter-container traffic, security group IDs, and subnets.
-        """
-        super(NLPScorer, self).__init__(
-            role,
-            instance_count,
-            instance_type,
-            volume_size_in_gb=volume_size_in_gb,
-            volume_kms_key=volume_kms_key,
-            output_kms_key=output_kms_key,
-            max_runtime_in_seconds=max_runtime_in_seconds,
-            sagemaker_session=sagemaker_session,
-            tags=tags,
-            base_job_name=NLP_SCORE_JOB_NAME,
-            network_config=network_config,
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            base_job_name=base_from_name(NLP_SCORE_JOB_NAME),
+            **kwargs,
         )
 
     def calculate(
@@ -395,145 +302,56 @@ class NLPScorer(FinanceProcessor):
         wait: bool = True,
         logs: bool = True,
     ):
-        """Runs a processing job to generate NLP scores for input text.
+        if urlparse(s3_output_path).scheme != "s3":
+            raise ValueError("s3_output_path must be an s3:// URI")
 
-        Args:
-            score_config (:class:`~smjsindustry.NLPScorerConfig`):
-                The config for the NLP scorer.
-            text_column_name (str): The name for column containing text to be summarized.
-            input_file_path (str): The input file path pointing to the input dataframe
-                containing the text to be summarized. It can be a local path or an S3 path.
-            s3_output_path (str): An S3 prefix in the format of
-                ``'s3://<output bucket name>/output/path'``.
-            output_file_name (str): The output file name. The full path is
-                ``'s3://<output bucket name>/output/path/output_file_name'``.
-            wait (bool): Whether the call should wait until the job completes (default: ``True``).
-            logs (bool): Whether to show the logs produced by the job (default: ``True``).
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, self._CONFIG_FILE)
 
-        Raises:
-            ValueError: if ``logs`` is True but ``wait`` is False.
+            cfg = copy.deepcopy(score_config.get_config())
+            cfg.update(
+                text_column_name=text_column_name,
+                output_file_name=output_file_name,
+            )
 
-        """
-        parse_result = urlparse(s3_output_path)
-        if parse_result.scheme != "s3":
-            raise Exception(
-                "Expected an S3 prefix in the format of s3://<output bucket name>/output/path"
-            )
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            score_config_file = os.path.join(tmpdirname, self._CONFIG_FILE)
-            with open(score_config_file, "w") as file_handle:
-                cloned_config = copy.deepcopy(score_config.get_config())
-                cloned_config["text_column_name"] = text_column_name
-                cloned_config["output_file_name"] = output_file_name
-                json.dump(cloned_config, file_handle)
-            config_input = ProcessingInput(
-                source=tmpdirname,
-                destination=self._PROCESSING_CONFIG,
-                input_name=self._CONFIG_INPUT_NAME,
-                s3_data_type="S3Prefix",
-                s3_input_mode="File",
-                s3_data_distribution_type="FullyReplicated",
-                s3_compression_type="None",
-            )
-            data_input = ProcessingInput(
-                source=input_file_path,
-                destination=self._PROCESSING_DATA,
-                input_name=self._DATA_INPUT_NAME,
-                s3_data_type="S3Prefix",
-                s3_input_mode="File",
-                s3_data_distribution_type="FullyReplicated",
-                s3_compression_type="None",
-            )
-            result_output = ProcessingOutput(
-                source=self._PROCESSING_OUTPUT,
-                destination=s3_output_path,
-                s3_upload_mode="EndOfJob",
-            )
-            logger.info("Starting SageMaker processing job to calculate NLP scores")
-            super().run(
-                inputs=[config_input, data_input],
-                outputs=[result_output],
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f)
+
+            s3_cfg = self._upload_dir_to_s3(tmp, f"{s3_output_path}/_config")
+            s3_data = self._ensure_s3_input(input_file_path, f"{s3_output_path}/_data")
+
+            self.run(
+                inputs=[
+                    self._build_processing_input(self._CONFIG_INPUT_NAME, s3_cfg, self._PROCESSING_CONFIG),
+                    self._build_processing_input(self._DATA_INPUT_NAME, s3_data, self._PROCESSING_DATA),
+                ],
+                outputs=[self._build_processing_output(s3_output_path)],
                 wait=wait,
                 logs=logs,
             )
-            logger.info("Completed SageMaker processing job to calculate NLP scores")
 
+
+# =============================================================================
+# Data Loader
+# =============================================================================
 
 class DataLoader(FinanceProcessor):
-    """Initializes a DataLoader instance to load a dataset.
 
-    For the general processing job configuration parameters of this class,
-    see the parameters in the
-    :class:`~smjsindustry.finance.processor.FinanceProcessor` class.
+    def __init__(self, *args, **kwargs):
+        # EDGAR retrieval must run on a single instance
+        if kwargs.get("instance_count", 1) != 1:
+            logger.info(
+                "DataLoader only supports instance_count=1; overriding value."
+            )
+            kwargs["instance_count"] = 1
 
-    The following ``load`` class method with
-    :class:`~smjsindustry.finance.EDGARDataSetConfig`
-    downloads SEC XML filings from the `SEC EDGAR database <https://www.sec.gov/edgar/>`_
-    and parses the downloaded XML filings to plain text files.
-
-    """
-
-    def __init__(
-        self,
-        role: str,
-        instance_count: int,
-        instance_type: str,
-        volume_size_in_gb: int = 30,
-        volume_kms_key: str = None,
-        output_kms_key: str = None,
-        max_runtime_in_seconds: int = None,
-        sagemaker_session: sagemaker.session.Session = None,
-        tags: List[Dict[str, str]] = None,
-        network_config: sagemaker.network.NetworkConfig = None,
-    ):
-        """Initializes a DataLoader instance to load data from the `SEC EDGAR database <https://www.sec.gov/edgar/>`_.
-
-        Args:
-            role (str): An AWS IAM role name or ARN. Amazon SageMaker Processing
-                uses this role to access AWS resources, such as
-                data stored in Amazon S3.
-            instance_count (int): The number of instances with which to run
-                a processing job.
-            instance_type (str): The type of EC2 instance to use for
-                processing, for example, 'ml.c4.xlarge'.
-            volume_size_in_gb (int): Size in GB of the EBS volume
-                to use for storing data during processing (default: 30).
-            volume_kms_key (str): A KMS key for the processing
-                volume (default: None).
-            output_kms_key (str): The KMS key ID for processing job outputs (default: None).
-            max_runtime_in_seconds (int): Timeout in seconds (default: None).
-                After this amount of time, Amazon SageMaker terminates the job,
-                regardless of its current status. If `max_runtime_in_seconds` is not
-                specified, the default value is 24 hours.
-            sagemaker_session (:class:`~sagemaker.session.Session`):
-                Session object which manages interactions with Amazon SageMaker and
-                any other AWS services needed. If not specified, the processor creates
-                one using the default AWS configuration chain.
-            tags (List[Dict[str, str]]): List of tags to be passed to the processing job
-                (default: None). For more, see
-                https://docs.aws.amazon.com/sagemaker/latest/dg/API_Tag.html.
-            network_config (:class:`~sagemaker.network.NetworkConfig`):
-                A :class:`~sagemaker.network.NetworkConfig`
-                object that configures network isolation, encryption of
-                inter-container traffic, security group IDs, and subnets.
-        """
-        if instance_count > 1:
-            logger.info("Dataloader processing jobs only support 1 instance.")
-            instance_count = 1
-
-        super(DataLoader, self).__init__(
-            role,
-            instance_count,
-            instance_type,
-            volume_size_in_gb=volume_size_in_gb,
-            volume_kms_key=volume_kms_key,
-            output_kms_key=output_kms_key,
-            max_runtime_in_seconds=max_runtime_in_seconds,
-            sagemaker_session=sagemaker_session,
-            tags=tags,
+        super().__init__(
+            *args,
             base_job_name=SEC_FILING_RETRIEVAL_JOB_NAME,
-            network_config=network_config,
+            **kwargs,
         )
+        self._local_fixture_used = False
+        self._local_fixture_output_uri: Optional[str] = None
 
     def load(
         self,
@@ -543,124 +361,96 @@ class DataLoader(FinanceProcessor):
         wait: bool = True,
         logs: bool = True,
     ):
-        """Runs a processing job to load dataset from `SEC EDGAR database <https://www.sec.gov/edgar/>`_.
+        parsed_output = urlparse(s3_output_path)
+        self._local_fixture_used = False
+        self._local_fixture_output_uri = None
+        local_fixture_path = os.getenv(LOCAL_DATALOADER_FIXTURE_ENV)
+        fallback_fixture_path = os.getenv(LOCAL_DATALOADER_FALLBACK_ENV)
 
-        Args:
-            dataset_config (:class:`~smjsindustry.finance.EDGARDataSetConfig`):
-                The config for the DataLoader.
-            s3_output_path (str): An S3 prefix in the format of
-                ``'s3://<output bucket name>/output/path'``.
-            output_file_name (str): The output file name. The full path is
-                ``'s3://<output bucket name>/output/path/output_file_name'``.
-            wait (bool): Whether the call should wait until the job completes (default: ``True``).
-            logs (bool): Whether to show the logs produced by the job (default: ``True``).
+        if parsed_output.scheme != "s3" and not (
+            local_fixture_path and parsed_output.scheme in ("file", "")
+        ):
+            raise ValueError("s3_output_path must be an s3:// URI")
 
-        Raises:
-            ValueError: if ``logs`` is True but ``wait`` is False.
-        """
-        parse_result = urlparse(s3_output_path)
-        if parse_result.scheme != "s3":
-            raise Exception(
-                "Expected an S3 prefix in the format of s3://<output bucket name>/output/path"
+        if local_fixture_path:
+            logger.info(
+                "Detected %s; uploading local fixture '%s' instead of running a "
+                "remote DataLoader job.",
+                LOCAL_DATALOADER_FIXTURE_ENV,
+                local_fixture_path,
             )
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            dataset_config_file = os.path.join(tmpdirname, self._CONFIG_FILE)
-            with open(dataset_config_file, "w") as file_handle:
-                cloned_config = copy.deepcopy(dataset_config.get_config())
-                cloned_config["output_file_name"] = output_file_name
-                json.dump(cloned_config, file_handle)
-            config_input = ProcessingInput(
-                input_name=self._CONFIG_INPUT_NAME,
-                source=tmpdirname,
-                destination=self._PROCESSING_CONFIG,
-                s3_data_type="S3Prefix",
-                s3_input_mode="File",
-                s3_data_distribution_type="FullyReplicated",
-                s3_compression_type="None",
-            )
-            result_output = ProcessingOutput(
-                source=self._PROCESSING_OUTPUT,
-                destination=s3_output_path,
-                s3_upload_mode="EndOfJob",
-            )
-            logger.info("Starting SageMaker processing job to load dataset")
-            super().run(
-                inputs=[config_input],
-                outputs=[result_output],
-                wait=wait,
-                logs=logs,
-            )
-            logger.info("Completed SageMaker processing job to load dataset")
+            self._run_local_fixture(local_fixture_path, s3_output_path, output_file_name)
+            self._local_fixture_used = True
+            return
 
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, self._CONFIG_FILE)
+
+            cfg: dict[str, object] = dict(
+                copy.deepcopy(dataset_config.get_config())
+            )
+            cfg["output_file_name"] = output_file_name
+
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f)
+
+            s3_cfg = self._upload_dir_to_s3(tmp, f"{s3_output_path}/_config")
+
+            try:
+                self.run(
+                    inputs=[
+                        self._build_processing_input(
+                            self._CONFIG_INPUT_NAME, s3_cfg, self._PROCESSING_CONFIG
+                        )
+                    ],
+                    outputs=[self._build_processing_output(s3_output_path)],
+                    wait=wait,
+                    logs=logs,
+                )
+            except FailedStatusError as exc:
+                if fallback_fixture_path:
+                    logger.warning(
+                        "DataLoader job failed (%s). Falling back to local dataset '%s'",
+                        exc,
+                        fallback_fixture_path,
+                    )
+                    self._run_local_fixture(
+                        fallback_fixture_path, s3_output_path, output_file_name
+                    )
+                    self._local_fixture_used = True
+                    return
+                raise
+
+    def _run_local_fixture(self, fixture_path: str, output_uri: str, output_file_name: str) -> None:
+        parsed = urlparse(output_uri)
+        if parsed.scheme == "s3":
+            destination_uri = f"{output_uri.rstrip('/')}/{output_file_name}"
+            self._upload_file_to_s3_uri(fixture_path, destination_uri)
+            logger.info("Uploaded dataloader fixture to %s", destination_uri)
+        elif parsed.scheme in ("file", ""):
+            base_path = parsed.path or output_uri
+            os.makedirs(base_path, exist_ok=True)
+            destination_path = os.path.join(base_path, output_file_name)
+            shutil.copyfile(fixture_path, destination_path)
+            destination_uri = f"file://{destination_path}"
+            logger.info("Copied dataloader fixture to %s", destination_path)
+        else:
+            raise ValueError("Fixture output path must be an s3:// or file:// URI")
+
+        self._local_fixture_output_uri = destination_uri
+
+
+# =============================================================================
+# SEC XML Filing Parser
+# =============================================================================
 
 class SECXMLFilingParser(FinanceProcessor):
-    """Initializes a SECXMLFilingParser instance that parses SEC XML filings.
 
-    For the general processing job configuration parameters of this class,
-    see the parameters in the
-    :class:`~smjsindustry.finance.processor.FinanceProcessor` class.
-
-    The following ``parse`` class method parses user-downloaded SEC XML filings
-    to plain text files.
-
-    """
-
-    def __init__(
-        self,
-        role: str,
-        instance_count: int,
-        instance_type: str,
-        volume_size_in_gb: int = 30,
-        volume_kms_key: str = None,
-        output_kms_key: str = None,
-        max_runtime_in_seconds: int = None,
-        sagemaker_session: sagemaker.session.Session = None,
-        tags: List[Dict[str, str]] = None,
-        network_config: sagemaker.network.NetworkConfig = None,
-    ):
-        """Initializes a SECXMLFilingParser instance to parse the SEC XML filings.
-
-        Args:
-            role (str): An AWS IAM role name or ARN. Amazon SageMaker Processing
-                uses this role to access AWS resources, such as
-                data stored in Amazon S3.
-            instance_count (int): The number of instances with which to run
-                a processing job.
-            instance_type (str): The type of EC2 instance to use for
-                processing, for example, 'ml.c4.xlarge'.
-            volume_size_in_gb (int): Size in GB of the EBS volume
-                to use for storing data during processing (default: 30).
-            volume_kms_key (str): A KMS key for the processing
-                volume (default: None).
-            output_kms_key (str): The KMS key ID for processing job outputs (default: None).
-            max_runtime_in_seconds (int): Timeout in seconds (default: None).
-                After this amount of time, Amazon SageMaker terminates the job,
-                regardless of its current status. If `max_runtime_in_seconds` is not
-                specified, the default value is 24 hours.
-            sagemaker_session (:class:`~sagemaker.session.Session`):
-                Session object which manages interactions with Amazon SageMaker and
-                any other AWS services needed. If not specified, the processor creates
-                one using the default AWS configuration chain.
-            tags (List[Dict[str, str]]): List of tags to be passed to the processing job
-                (default: None). For more, see
-                https://docs.aws.amazon.com/sagemaker/latest/dg/API_Tag.html.
-            network_config (:class:`~sagemaker.network.NetworkConfig`):
-                A :class:`~sagemaker.network.NetworkConfig`
-                object that configures network isolation, encryption of
-                inter-container traffic, security group IDs, and subnets.
-        """
-        super(SECXMLFilingParser, self).__init__(
-            role,
-            instance_count,
-            instance_type,
-            volume_size_in_gb=volume_size_in_gb,
-            volume_kms_key=volume_kms_key,
-            output_kms_key=output_kms_key,
-            max_runtime_in_seconds=max_runtime_in_seconds,
-            sagemaker_session=sagemaker_session,
-            tags=tags,
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
             base_job_name=SEC_FILING_PARSER_JOB_NAME,
-            network_config=network_config,
+            **kwargs,
         )
 
     def parse(
@@ -670,57 +460,24 @@ class SECXMLFilingParser(FinanceProcessor):
         wait: bool = True,
         logs: bool = True,
     ):
-        """Runs a processing job to parse SEC XML filings.
+        if urlparse(s3_output_path).scheme != "s3":
+            raise ValueError("s3_output_path must be an s3:// URI")
 
-        Args:
-            input_data_path (str): The input file path pointing to directory containing
-                the SEC XML filings to be parsed. It can be a local folder or an S3 path.
-            s3_output_path (str): An S3 prefix in the format of
-                ``'s3://<output bucket name>/output/path'``.
-            wait (bool): Whether the call should wait until the job completes (default: ``True``).
-            logs (bool): Whether to show the logs produced by the job (default: ``True``).
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, self._CONFIG_FILE)
 
-        Raises:
-            ValueError: if ``logs`` is True but ``wait`` is False.
-        """
-        parse_result = urlparse(s3_output_path)
-        if parse_result.scheme != "s3":
-            raise Exception(
-                "Expected an S3 prefix in the format of s3://<output bucket name>/output/path"
-            )
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            parser_config_file = os.path.join(tmpdirname, self._CONFIG_FILE)
-            with open(parser_config_file, "w") as file_handle:
-                parser_config = {"processor_type": SEC_XML_FILING_PARSER}
-                json.dump(parser_config, file_handle)
-            config_input = ProcessingInput(
-                source=tmpdirname,
-                destination=self._PROCESSING_CONFIG,
-                input_name=self._CONFIG_INPUT_NAME,
-                s3_data_type="S3Prefix",
-                s3_input_mode="File",
-                s3_data_distribution_type="FullyReplicated",
-                s3_compression_type="None",
-            )
-            data_input = ProcessingInput(
-                source=input_data_path,
-                destination=self._PROCESSING_DATA,
-                input_name=self._DATA_INPUT_NAME,
-                s3_data_type="S3Prefix",
-                s3_input_mode="File",
-                s3_data_distribution_type="FullyReplicated",
-                s3_compression_type="None",
-            )
-            result_output = ProcessingOutput(
-                source=self._PROCESSING_OUTPUT,
-                destination=s3_output_path,
-                s3_upload_mode="EndOfJob",
-            )
-            logger.info("Starting SageMaker processing job to parse sec filings")
-            super().run(
-                inputs=[config_input, data_input],
-                outputs=[result_output],
+            with open(cfg_path, "w") as f:
+                json.dump({"processor_type": SEC_XML_FILING_PARSER}, f)
+
+            s3_cfg = self._upload_dir_to_s3(tmp, f"{s3_output_path}/_config")
+            s3_data = self._ensure_s3_input(input_data_path, f"{s3_output_path}/_data")
+
+            self.run(
+                inputs=[
+                    self._build_processing_input(self._CONFIG_INPUT_NAME, s3_cfg, self._PROCESSING_CONFIG),
+                    self._build_processing_input(self._DATA_INPUT_NAME, s3_data, self._PROCESSING_DATA),
+                ],
+                outputs=[self._build_processing_output(s3_output_path)],
                 wait=wait,
                 logs=logs,
             )
-            logger.info("Completed SageMaker processing job to parse sec filings")

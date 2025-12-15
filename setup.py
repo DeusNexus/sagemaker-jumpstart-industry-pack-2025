@@ -1,4 +1,4 @@
-# Copyright 2017-2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2017-2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"). You
 # may not use this file except in compliance with the License. A copy of
@@ -11,7 +11,6 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """Placeholder docstring"""
-from __future__ import absolute_import
 
 import os
 from glob import glob
@@ -32,9 +31,11 @@ def read_version():
 
 
 # Declare minimal set for installation
+# UPDATED: SageMaker v3 support requires newer python and library versions
 required_packages = [
     "packaging>=20.0",
-    "sagemaker>=2.111.0",
+    "sagemaker>=3.0",
+    "pydantic>=2.0",
 ]
 
 
@@ -48,7 +49,7 @@ extras["test"] = (
         extras["all"],
         "tox",
         "flake8",
-        "pytest<6.1.0",
+        "pytest>=7.0.0", 
         "pytest-cov",
         "pytest-rerunfailures",
         "pytest-timeout",
@@ -71,18 +72,20 @@ setup(
     include_package_data=True,
     long_description=read("README.rst"),
     author="Amazon Web Services",
-    url="https://github.com/aws/sagemaker-jumpstart-industry-pack/",
+    # UPDATED URL to your new repository
+    url="https://github.com/DeusNexus/sagemaker-jumpstart-industry-pack-2025",
     license="Apache License 2.0",
-    keywords="ML Amazon AWS AI Jumpstart Industry",
+    # UPDATED keywords
+    keywords="ML Amazon AWS AI Jumpstart Industry 2025",
+    python_requires=">=3.11", 
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Developers",
         "Natural Language :: English",
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.11", 
+        "Programming Language :: Python :: 3.12",
     ],
     install_requires=required_packages,
     extras_require=extras,

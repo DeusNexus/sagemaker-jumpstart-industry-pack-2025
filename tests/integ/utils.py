@@ -11,7 +11,6 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """Placeholder docstring"""
-from __future__ import absolute_import
 
 import random
 import time
@@ -19,8 +18,9 @@ import time
 
 def unique_name_from_base(base, max_length=63):
     """Placeholder Docstring"""
-    unique = "%04x" % random.randrange(16**4)  # 4-digit hex
+    unique = f"{random.randrange(16**4):04x}"  # 4-digit hex, updated to f-string
     ts = str(int(time.time()))
     available_length = max_length - 2 - len(ts) - len(unique)
     trimmed = base[:available_length]
-    return "{}-{}-{}".format(trimmed, ts, unique)
+    # UPDATED: Use f-string
+    return f"{trimmed}-{ts}-{unique}"

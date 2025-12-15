@@ -10,10 +10,10 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-from __future__ import absolute_import
 
-from mock import Mock, MagicMock
+from unittest.mock import Mock, MagicMock
 import pytest
+import smjsindustry.config as smjs_config  # noqa: E402
 
 from smjsindustry import (
     Summarizer,
@@ -24,6 +24,7 @@ from smjsindustry import (
     NLPSCORE_NO_WORD_LIST,
     NLPScoreType,
 )
+from smjsindustry.config import SEC_USER_AGENT_ENV
 from smjsindustry.finance import DataLoader, SECXMLFilingParser, EDGARDataSetConfig
 from smjsindustry.finance.constants import (
     JACCARD_SUMMARIZER,
@@ -43,9 +44,7 @@ from smjsindustry.finance.utils import retrieve_image
 BUCKET_NAME = "mybucket"
 REGION = "us-west-2"
 ROLE = "arn:aws:iam::627189473827:role/SageMakerRole"
-IMAGE_URI = "935494966801.dkr.ecr.us-west-2.amazonaws.com/{}:{}".format(
-    REPOSITORY, CONTAINER_IMAGE_VERSION
-)
+IMAGE_URI = f"935494966801.dkr.ecr.us-west-2.amazonaws.com/{REPOSITORY}:{CONTAINER_IMAGE_VERSION}"
 
 
 @pytest.fixture(scope="module")
@@ -68,6 +67,7 @@ def sagemaker_session():
     session_mock.describe_processing_job = MagicMock(
         name="describe_processing_job", return_value=get_describe_response_inputs_and_outputs()
     )
+    session_mock.process = MagicMock(name="process")
     return session_mock
 
 
@@ -177,7 +177,7 @@ def test_jaccard_summarizer_config(
         assert str(error.value) == (
             "JaccardSummarizerConfig requires summary_size to be a non-negative integer."
         )
-    elif not isinstance(summary_percentage, float):
+    elif not isinstance(summary_percentage, float) and summary_percentage is not None:
         with pytest.raises(TypeError) as error:
             JaccardSummarizerConfig(
                 summary_size=summary_size,
@@ -189,7 +189,7 @@ def test_jaccard_summarizer_config(
         assert str(error.value) == (
             "JaccardSummarizerConfig requires summary_percentage to be a float."
         )
-    elif cutoff < 0 or cutoff > 1:
+    elif cutoff is not None and (cutoff < 0 or cutoff > 1):
         with pytest.raises(ValueError) as error:
             JaccardSummarizerConfig(
                 summary_size=summary_size,
@@ -276,7 +276,7 @@ def test_kmedoids_summarizer_config(summary_size, vector_size, min_count, epochs
                 init=init,
             )
         assert str(error.value) == ("KMedoidsSummarizerConfig requires min_count to be an integer.")
-    elif epochs < 0:
+    elif epochs is not None and epochs < 0:
         with pytest.raises(ValueError) as error:
             KMedoidsSummarizerConfig(
                 summary_size=summary_size,
@@ -353,6 +353,8 @@ def test_nlp_scorer_config(score_type):
             "a list of NLPScoreType objects."
         )
     else:
+        # Note: Pylance errors here are due to type hints in source files (NLPScoreType and NLPScorerConfig)
+        # not correctly allowing `None` for word_list and a single object for nlp_score_types.
         config = NLPScorerConfig(score_type).get_config()
         config_with_list_input = NLPScorerConfig([score_type]).get_config()
         expected_config = {
@@ -448,15 +450,15 @@ def test_nlp_score_type(score_name, word_list):
             with pytest.raises(TypeError) as error:
                 NLPScoreType(score_name, word_list)
             assert str(error.value) == (
-                "NLPScoreType with score_name {} requires its word_list argument to be None."
-            ).format(score_name)
+                f"NLPScoreType with score_name {score_name} requires its word_list argument to be None."
+            )
     else:
         if not isinstance(word_list, list):
             with pytest.raises(TypeError) as error:
                 NLPScoreType(score_name, word_list)
             assert str(error.value) == (
-                "NLPScoreType with score_name {} requires its word_list argument to be a list."
-            ).format(score_name)
+                f"NLPScoreType with score_name {score_name} requires its word_list argument to be a list."
+            )
         elif score_name in NLPScoreType.DEFAULT_SCORE_TYPES:
             if word_list and any(not isinstance(word, str) for word in word_list):
                 with pytest.raises(TypeError) as error:
@@ -467,9 +469,9 @@ def test_nlp_score_type(score_name, word_list):
                 with pytest.raises(ValueError) as error:
                     NLPScoreType(score_name, word_list)
                 assert str(error.value) == (
-                    "NLPScoreType with custom score_name {} requires "
+                    f"NLPScoreType with custom score_name {score_name} requires "
                     "its word_list argument to be a non-empty list."
-                ).format(score_name)
+                )
             elif any(not isinstance(word, str) for word in word_list):
                 with pytest.raises(TypeError) as error:
                     NLPScoreType(score_name, word_list)
@@ -491,7 +493,16 @@ def test_edgar_dataset_config(
     filing_date_start,
     filing_date_end,
     email_as_user_agent,
+    monkeypatch,
 ):
+    monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+    legacy_env = getattr(
+        smjs_config,
+        "LEGACY_SEC_CONTACT_EMAIL_ENV",
+        "SMJS_FINANCE_SEC_CONTACT_EMAIL",
+    )
+    monkeypatch.delenv(legacy_env, raising=False)
+    monkeypatch.setattr(smjs_config, "DEFAULT_SEC_USER_AGENT", None)
     if tickers_or_ciks in ([12, 2], [], None):
         with pytest.raises(TypeError) as error:
             EDGARDataSetConfig(
@@ -569,7 +580,7 @@ def test_edgar_dataset_config(
             error.value
         )
     elif email_as_user_agent is None:
-        with pytest.raises(TypeError) as error:
+        with pytest.raises(ValueError) as error:
             EDGARDataSetConfig(
                 tickers_or_ciks=tickers_or_ciks,
                 form_types=form_types,
@@ -577,7 +588,11 @@ def test_edgar_dataset_config(
                 filing_date_end=filing_date_end,
                 email_as_user_agent=email_as_user_agent,
             )
-        assert "EDGARDataSetConfig requires email_as_user_agent to be a string." in str(error.value)
+        assert (
+            "EDGARDataSetConfig requires email_as_user_agent to be provided or set via the "
+            f"{SEC_USER_AGENT_ENV} environment variable."
+            in str(error.value)
+        )
     elif email_as_user_agent in ("", "abc"):
         with pytest.raises(ValueError) as error:
             EDGARDataSetConfig(
@@ -588,7 +603,8 @@ def test_edgar_dataset_config(
                 email_as_user_agent=email_as_user_agent,
             )
         assert (
-            "EDGARDataSetConfig requires email_as_user_agent to be a valid email address."
+            "EDGARDataSetConfig requires email_as_user_agent (the SEC user agent string) "
+            "to include a valid contact email address."
             in str(error.value)
         )
     else:
@@ -608,6 +624,19 @@ def test_edgar_dataset_config(
             "email_as_user_agent": email_as_user_agent,
         }
         assert dataset_config.get_config() == expected_config
+
+
+def test_edgar_dataset_config_env_fallback(monkeypatch):
+    monkeypatch.setenv(SEC_USER_AGENT_ENV, "ExamplePipeline/1.0 (contact: env.user@example.com)")
+    monkeypatch.setattr(smjs_config, "DEFAULT_SEC_USER_AGENT", None)
+    config = EDGARDataSetConfig(
+        tickers_or_ciks=["amzn"],
+        form_types=["10-Q"],
+        filing_date_start="2020-01-01",
+        filing_date_end="2020-02-01",
+        email_as_user_agent=None,
+    )
+    assert config.email_as_user_agent == "ExamplePipeline/1.0 (contact: env.user@example.com)"
 
 
 def test_dataloader(
@@ -651,122 +680,98 @@ def test_parser(
 
 
 def get_expected_args_all_parameters(job_name, s3_output_path, s3_input_path=None):
+    # UPDATED: Use f-string for ImageUri
+    image_uri_spec = f"935494966801.dkr.ecr.us-west-2.amazonaws.com/{REPOSITORY}:{CONTAINER_IMAGE_VERSION}"
+    config_s3_uri = f"{s3_output_path}/_config"
+
+    base_args = {
+        "output_config": {
+            "Outputs": [
+                {
+                    "OutputName": "output-1",
+                    "AppManaged": False,
+                    "S3Output": {
+                        "S3Uri": s3_output_path,
+                        "LocalPath": "/opt/ml/processing/output",
+                        "S3UploadMode": "EndOfJob",
+                    },
+                }
+            ]
+        },
+        "experiment_config": None,
+        "job_name": job_name,
+        "resources": {
+            "ClusterConfig": {
+                "InstanceType": "ml.c5.xlarge",
+                "InstanceCount": 1,
+                "VolumeSizeInGB": 30,
+            }
+        },
+        "stopping_condition": None,
+        "app_specification": {
+            "ImageUri": image_uri_spec
+        },
+        "environment": None,
+        "network_config": None,
+        "role_arn": ROLE,
+        "tags": None,
+    }
+
+    config_input = {
+        "InputName": "config",
+        "AppManaged": False,
+        "S3Input": {
+            "S3Uri": config_s3_uri,
+            "LocalPath": "/opt/ml/processing/input/config",
+            "S3DataType": "S3Prefix",
+            "S3InputMode": "File",
+            "S3DataDistributionType": "FullyReplicated",
+            "S3CompressionType": "None",
+        },
+    }
+
     if s3_input_path:
-        return {
-            "inputs": [
-                {
-                    "InputName": "config",
-                    "AppManaged": False,
-                    "S3Input": {
-                        "S3Uri": "mocked_s3_uri_from_upload_data",
-                        "LocalPath": "/opt/ml/processing/input/config",
-                        "S3DataType": "S3Prefix",
-                        "S3InputMode": "File",
-                        "S3DataDistributionType": "FullyReplicated",
-                        "S3CompressionType": "None",
-                    },
-                },
-                {
-                    "InputName": "data",
-                    "AppManaged": False,
-                    "S3Input": {
-                        "S3Uri": s3_input_path,
-                        "LocalPath": "/opt/ml/processing/input/data",
-                        "S3DataType": "S3Prefix",
-                        "S3InputMode": "File",
-                        "S3DataDistributionType": "FullyReplicated",
-                        "S3CompressionType": "None",
-                    },
-                },
-            ],
-            "output_config": {
-                "Outputs": [
-                    {
-                        "OutputName": "output-1",
-                        "AppManaged": False,
-                        "S3Output": {
-                            "S3Uri": s3_output_path,
-                            "LocalPath": "/opt/ml/processing/output",
-                            "S3UploadMode": "EndOfJob",
-                        },
-                    }
-                ]
+        data_input = {
+            "InputName": "data",
+            "AppManaged": False,
+            "S3Input": {
+                "S3Uri": s3_input_path,
+                "LocalPath": "/opt/ml/processing/input/data",
+                "S3DataType": "S3Prefix",
+                "S3InputMode": "File",
+                "S3DataDistributionType": "FullyReplicated",
+                "S3CompressionType": "None",
             },
-            "experiment_config": None,
-            "job_name": job_name,
-            "resources": {
-                "ClusterConfig": {
-                    "InstanceType": "ml.c5.xlarge",
-                    "InstanceCount": 1,
-                    "VolumeSizeInGB": 30,
-                }
-            },
-            "stopping_condition": None,
-            "app_specification": {
-                "ImageUri": "935494966801.dkr.ecr.us-west-2.amazonaws.com/{}:{}".format(
-                    REPOSITORY, CONTAINER_IMAGE_VERSION
-                )
-            },
-            "environment": None,
-            "network_config": None,
-            "role_arn": ROLE,
-            "tags": None,
         }
+        base_args["inputs"] = [config_input, data_input]
     else:
-        return {
-            "inputs": [
-                {
-                    "InputName": "config",
-                    "AppManaged": False,
-                    "S3Input": {
-                        "S3Uri": "mocked_s3_uri_from_upload_data",
-                        "LocalPath": "/opt/ml/processing/input/config",
-                        "S3DataType": "S3Prefix",
-                        "S3InputMode": "File",
-                        "S3DataDistributionType": "FullyReplicated",
-                        "S3CompressionType": "None",
-                    },
-                }
-            ],
-            "output_config": {
-                "Outputs": [
-                    {
-                        "OutputName": "output-1",
-                        "AppManaged": False,
-                        "S3Output": {
-                            "S3Uri": s3_output_path,
-                            "LocalPath": "/opt/ml/processing/output",
-                            "S3UploadMode": "EndOfJob",
-                        },
-                    }
-                ]
-            },
-            "experiment_config": None,
-            "job_name": job_name,
-            "resources": {
-                "ClusterConfig": {
-                    "InstanceType": "ml.c5.xlarge",
-                    "InstanceCount": 1,
-                    "VolumeSizeInGB": 30,
-                }
-            },
-            "stopping_condition": None,
-            "app_specification": {
-                "ImageUri": "935494966801.dkr.ecr.us-west-2.amazonaws.com/{}:{}".format(
-                    REPOSITORY, CONTAINER_IMAGE_VERSION
-                )
-            },
-            "environment": None,
-            "network_config": None,
-            "role_arn": ROLE,
-            "tags": None,
-        }
+        base_args["inputs"] = [config_input]
+
+    return base_args
 
 
 def get_describe_response_inputs_and_outputs():
+    # We pass a placeholder value for s3_input_path to ensure the structure with 'data' input is returned
+    expected_args = get_expected_args_all_parameters(None, None, s3_input_path="mock_path")
     return {
-        "ProcessingInputs": get_expected_args_all_parameters(None, None, None)["inputs"],
-        "ProcessingOutputConfig": get_expected_args_all_parameters(None, None, None)[
-            "output_config"
-        ],
+        "ProcessingInputs": expected_args["inputs"],
+        "ProcessingOutputConfig": expected_args["output_config"],
     }
+@pytest.fixture(scope="module", autouse=True)
+def patch_boto3():
+    """Stub out boto3 client creation so unit tests do not require AWS deps."""
+    from smjsindustry.finance import processor as processor_module
+
+    original_boto3 = processor_module.boto3
+
+    mock_client = Mock(name="s3_client")
+    mock_client.upload_file = Mock(name="upload_file")
+
+    mock_boto3 = Mock(name="boto3")
+    mock_boto3.client.return_value = mock_client
+
+    processor_module.boto3 = mock_boto3
+    try:
+        yield mock_boto3
+    finally:
+        processor_module.boto3 = original_boto3

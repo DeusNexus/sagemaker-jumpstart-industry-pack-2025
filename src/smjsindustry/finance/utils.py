@@ -11,12 +11,14 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """The SageMaker JumpStart Industry utils module."""
-from __future__ import absolute_import
 
-import re
-import os
 import json
-from typing import Callable
+import os
+import re
+from functools import lru_cache
+from typing import Callable, Dict, Literal, Mapping
+
+from pydantic import TypeAdapter, ValidationError
 import pandas as pd
 from smjsindustry.finance.constants import (
     IMAGE_CONFIG_FILE,
@@ -24,6 +26,20 @@ from smjsindustry.finance.constants import (
     REPOSITORY,
     CONTAINER_IMAGE_VERSION,
 )
+
+FreqLiteral = Literal["D", "W", "M", "Q", "Y"]
+FreqLabelHandler = Callable[[str], str]
+ImageConfig = Mapping[str, str]
+
+_IMAGE_CONFIG_VALIDATOR = TypeAdapter(dict[str, str])
+
+__all__ = [
+    "FreqLiteral",
+    "get_freq_label",
+    "load_image_uri_config",
+    "retrieve_image",
+    "FREQ_LABEL_MAP",
+]
 
 
 def _get_freq_label_by_day(date_value: str) -> str:
@@ -54,7 +70,8 @@ def _get_freq_label_by_week(date_value: str) -> str:
     if not bool(re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", date_value)):
         raise ValueError("Date needs to be in yyyy-mm-dd format when freq is W")
     ts = pd.Timestamp(date_value)
-    return "{}W{}".format(ts.year, ts.week)
+    # Converted to f-string
+    return f"{ts.year}W{ts.week}"
 
 
 def _get_freq_label_by_month(date_value: str) -> str:
@@ -71,7 +88,8 @@ def _get_freq_label_by_month(date_value: str) -> str:
     if not bool(re.match(r"^\d{4}-\d{1,2}(-\d{1,2})?$", date_value)):
         raise ValueError("Date needs to be in yyyy-mm-dd or yyyy-mm format when freq is M")
     ts = pd.Timestamp(date_value)
-    return "{}M{}".format(ts.year, ts.month)
+    # Converted to f-string
+    return f"{ts.year}M{ts.month}"
 
 
 def _get_freq_label_by_quarter(date_value: str) -> str:
@@ -88,7 +106,8 @@ def _get_freq_label_by_quarter(date_value: str) -> str:
     if not bool(re.match(r"^\d{4}-\d{1,2}(-\d{1,2})?$", date_value)):
         raise ValueError("Date needs to be in yyyy-mm-dd or yyyy-mm format when freq is Q")
     ts = pd.Timestamp(date_value)
-    return "{}Q{}".format(ts.year, ts.quarter)
+    # Converted to f-string
+    return f"{ts.year}Q{ts.quarter}"
 
 
 def _get_freq_label_by_year(date_value: str) -> str:
@@ -108,7 +127,7 @@ def _get_freq_label_by_year(date_value: str) -> str:
     return str(ts.year)
 
 
-FREQ_LABEL_MAP = {
+FREQ_LABEL_MAP: Dict[FreqLiteral, FreqLabelHandler] = {
     "D": _get_freq_label_by_day,
     "W": _get_freq_label_by_week,
     "M": _get_freq_label_by_month,
@@ -117,7 +136,7 @@ FREQ_LABEL_MAP = {
 }
 
 
-def get_freq_label(date_value: str, freq: str) -> Callable:
+def get_freq_label(date_value: str, freq: str) -> str:
     """Gets frequency label for the date value.
 
     Args:
@@ -127,17 +146,19 @@ def get_freq_label(date_value: str, freq: str) -> Callable:
             ``{'Y', 'Q', 'M', 'W', 'D'}``, default ``'Q'``.
 
     Returns:
-        python function: The function call to get date aggregated by certain frequency.
+        str: The date value aggregated by the specified frequency.
     """
     freq = freq.upper()
-    if freq not in FREQ_LABEL_MAP:
-        raise ValueError("frequency {} not supported".format(freq))
+    handler = FREQ_LABEL_MAP.get(freq)
+    if handler is None:
+        raise ValueError(f"frequency {freq} not supported")
     if not isinstance(date_value, str):
-        raise Exception("The date column needs to be string")
-    return FREQ_LABEL_MAP[freq](date_value.upper())
+        raise ValueError("The date column needs to be string")
+    return handler(date_value.upper())
 
 
-def load_image_uri_config():
+@lru_cache(maxsize=1)
+def load_image_uri_config() -> ImageConfig:
     """Loads the JSON config for the image URI.
 
     Returns:
@@ -145,10 +166,15 @@ def load_image_uri_config():
     """
     fname = os.path.join(os.path.dirname(__file__), IMAGE_CONFIG_FILE)
     with open(fname) as f:
-        return json.load(f)
+        config = json.load(f)
+
+    try:
+        return _IMAGE_CONFIG_VALIDATOR.validate_python(config)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid image configuration in {fname}") from exc
 
 
-def retrieve_image(region):
+def retrieve_image(region: str) -> str:
     """Retrieves the Amazon ECR image URI for the Docker image matching the given region.
 
     Args:
@@ -158,6 +184,13 @@ def retrieve_image(region):
         str: the Amazon ECR image URI for the corresponding Docker image.
     """
     config = load_image_uri_config()
-    account_id = config[region]
-    repository = "{}:{}".format(REPOSITORY, CONTAINER_IMAGE_VERSION)
+    try:
+        account_id = config[region]
+    except KeyError as exc:
+        raise ValueError(f"Region '{region}' is not supported in the image config.") from exc
+    # NOTE: The CONTAINER_IMAGE_VERSION defined in constants.py must reference a
+    # Python 3.11-compatible image tag for a successful processing job.
+    # Converted to f-string
+    repository = f"{REPOSITORY}:{CONTAINER_IMAGE_VERSION}"
+    # Converted to f-string
     return ECR_URI_TEMPLATE.format(account_id=account_id, region=region, repository=repository)

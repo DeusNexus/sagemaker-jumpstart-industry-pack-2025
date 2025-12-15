@@ -11,8 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """The NLP score type module of SageMaker JumpStart Industry."""
-from __future__ import absolute_import
-from typing import List
+from typing import List, Optional # Added Optional
 
 NLPSCORE_NO_WORD_LIST = ["sentiment", "polarity", "readability"]
 
@@ -50,7 +49,7 @@ class NLPScoreType:
             ``NLPScoreType.CERTAINTY``, ``NLPScoreType.UNCERTAINTY``, ``NLPScoreType.FRAUD``,
             ``NLPScoreType.LITIGIOUS``, ``NLPScoreType.RISK``, ``NLPScoreType.SAFE``,
             ``NLPScoreType.READABILITY``, ``NLPScoreType.SENTIMENT``.
-        word_list (List[str]):
+        word_list (Optional[List[str]]): # Updated type hint
             A list of words corresponding to the topic indicated by ``score_name``.
 
             The following ``score_names`` values require the ``word_list`` argument to be ``None``
@@ -85,30 +84,33 @@ class NLPScoreType:
         READABILITY,
     ]
 
-    def __init__(self, score_name: str, word_list: List[str]):
+    def __init__(self, score_name: str, word_list: Optional[List[str]]): # Updated signature
         """Initializes an ``NLPScoreType`` instance."""
         score_name = score_name.lower()
         self._score_name = score_name
         if score_name in NLPSCORE_NO_WORD_LIST:
             if word_list is not None:
+                # Converted to f-string
                 raise TypeError(
-                    "NLPScoreType with score_name {} requires its word_list "
-                    "argument to be None.".format(score_name)
+                    f"NLPScoreType with score_name {score_name} requires its word_list "
+                    "argument to be None."
                 )
         else:
             if not isinstance(word_list, list):
+                # Converted to f-string
                 raise TypeError(
-                    "NLPScoreType with score_name {} requires its word_list "
-                    "argument to be a list.".format(score_name)
+                    f"NLPScoreType with score_name {score_name} requires its word_list "
+                    "argument to be a list."
                 )
             if score_name in NLPScoreType.DEFAULT_SCORE_TYPES:
                 if word_list and any(not isinstance(word, str) for word in word_list):
                     raise TypeError("word_list argument must contain only strings.")
             else:
                 if not word_list:
+                    # Converted to f-string
                     raise ValueError(
-                        "NLPScoreType with custom score_name {} requires its word_list "
-                        "argument to be a non-empty list.".format(score_name)
+                        f"NLPScoreType with custom score_name {score_name} requires its word_list "
+                        "argument to be a non-empty list."
                     )
                 if any(not isinstance(word, str) for word in word_list):
                     raise TypeError("word_list argument must contain only strings.")
@@ -120,6 +122,9 @@ class NLPScoreType:
         return self._score_name
 
     @property
-    def word_list(self) -> List[str]:
+    def word_list(self) -> Optional[List[str]]: # Updated return type
         """Gets the string of the ``word_list`` argument."""
         return self._word_list
+
+
+__all__ = ["NLPScoreType", "NLPSCORE_NO_WORD_LIST"]
